@@ -395,168 +395,27 @@ export default {
       return;
     }
 
-    // ── 4. Bot mention / name trigger → AI reply ──────────────────────────────
-    const botMentioned = message.mentions.has(client.user.id);
+  // ── 4. Bot mention / name trigger → reaction only ─────────────────────────
 
-    // Also match bot's server nickname (e.g. "Vanguard") not just the username ("Vanguard0-1")
-    const botNickInServer = message.guild.members.me?.nickname?.toLowerCase() ?? null;
-    const msgLower        = message.content.toLowerCase();
-    const botNamed        = !botMentioned && (
-      msgLower.includes(client.user.username.toLowerCase()) ||
-      (botNickInServer && msgLower.includes(botNickInServer))
-    );
+const botMentioned = message.mentions.has(client.user.id);
 
- if (botMentioned || botNamed) {
+// detect bot nickname or username
+const botNickInServer = message.guild.members.me?.nickname?.toLowerCase() ?? null;
+const msgLower = message.content.toLowerCase();
+
+const botNamed = !botMentioned && (
+  msgLower.includes(client.user.username.toLowerCase()) ||
+  (botNickInServer && msgLower.includes(botNickInServer))
+);
+
+// If bot is mentioned or its name appears → react only
+if (botMentioned || botNamed) {
   await message.react("👀").catch(() => {});
   return;
 }
+      
 
-      // Resolve mentions to readable names, strip bot mention/name
-      const resolved = resolveMentions(message.content, message.guild);
-      let userText   = resolved
-        .replace(new RegExp(`@${client.user.username}`, 'gi'), '')
-        .trim();
-      if (botNickInServer) userText = userText.replace(new RegExp(botNickInServer, 'gi'), '').trim();
-
-      // Keep typing indicator alive every 8 s until we reply
-      await message.channel.sendTyping().catch(() => {});
-      const typingInterval = setInterval(() => {
-        message.channel.sendTyping().catch(() => {});
-      }, 8_000);
-
-      // Fetch member + owner in parallel
-      const [member, ownerName] = await Promise.all([
-        message.guild.members.cache.get(message.author.id)
-          ?? message.guild.members.fetch(message.author.id).catch(() => null),
-        fetchOwnerName(message.guild),
-      ]);
-
-      // Mentioned members context (for roast/greet/ping targets)
-      const mentionedMembers = [...(message.mentions.members?.values() ?? [])]
-        .filter(m => m.id !== client.user.id);
-      const mentionContext = buildMentionContext(mentionedMembers, message.guild);
-
-      // Detect if user explicitly wants to ping someone
-      const hasPingIntent = PING_INTENT_RE.test(userText) && mentionedMembers.length > 0;
-
-      const systemPrompt = member
-        ? buildSystemPrompt(message.guild, member, client, ownerName) + mentionContext
-        : `You are Vanguard AI, assistant of the Vanguards Brawl Stars Discord server. Owner: sunnybook.${mentionContext}`;
-
-      const histKey = `${message.guild.id}:${message.author.id}`;
-      const history = conversationHistory.get(histKey) ?? [];
-
-      const prompt = userText || 'The user just pinged you with no message. Give a cute, fun, personality-filled 1-2 line greeting.';
-      history.push({ role: 'user', content: prompt });
-
-      try {
-        // 25-second timeout
-        const controller = new AbortController();
-        const timeout    = setTimeout(() => controller.abort(), 25_000);
-
-        const response = await getOpenAI().chat.completions.create({
-          model:    'gpt-5-mini',
-          messages: [{ role: 'system', content: systemPrompt }, ...history],
-          max_completion_tokens: userText ? 600 : 150,
-        }, { signal: controller.signal }).finally(() => clearTimeout(timeout));
-
-        const rawReply = response.choices[0]?.message?.content?.trim()
-          ?? "omg something broke in my brain, try again 😭";
-
-        const aiReply = stripMentions(rawReply);
-        logInfo(`AI reply (${aiReply.length} chars): "${aiReply.slice(0, 80)}"`);
-
-        history.push({ role: 'assistant', content: aiReply });
-        if (history.length > MAX_HISTORY * 2) history.splice(0, history.length - MAX_HISTORY * 2);
-        conversationHistory.set(histKey, history);
-
-        clearInterval(typingInterval);
-
-        // Build final content
-        let finalText       = aiReply;
-        let allowedMentions = { parse: [] };
-        if (hasPingIntent) {
-          const mentionStr = mentionedMembers.map(m => `<@${m.id}>`).join(' ');
-          finalText        = `${mentionStr} ${aiReply}`;
-          allowedMentions  = { users: mentionedMembers.map(m => m.id) };
-        }
-
-        // ── Send with 3-level fallback ─────────────────────────────────────────
-        const trySend = async (text) => {
-          const safe = text?.trim();
-          if (!safe) { logErr('trySend: empty text, skipping'); return; }
-
-          const chunks = safe.length <= 1990 ? [safe] : (() => {
-            const cs = []; let cur = '';
-            for (const line of safe.split('\n')) {
-              if ((cur + '\n' + line).length > 1900) { if (cur) cs.push(cur.trim()); cur = line; }
-              else { cur = cur ? cur + '\n' + line : line; }
-            }
-            if (cur) cs.push(cur.trim());
-            return cs;
-          })();
-
-          for (const [i, chunk] of chunks.entries()) {
-            const am = i === 0 ? allowedMentions : { parse: [] };
-
-            // Attempt 1: reply() — creates a threaded reply arrow in Discord
-            let sent = await message.reply({ content: chunk, allowedMentions: am })
-              .catch(e => { logErr(`reply() failed: ${e.message}`); return null; });
-
-            // Attempt 2: channel.send() with reference but failIfNotExists:false
-            if (!sent) {
-              sent = await message.channel.send({
-                content: chunk, allowedMentions: am,
-                reply:   { messageReference: message.id, failIfNotExists: false },
-              }).catch(e => { logErr(`channel.send(ref) failed: ${e.message}`); return null; });
-            }
-
-            // Attempt 3: plain channel.send() — no reference at all
-            if (!sent) {
-              sent = await message.channel.send({ content: chunk, allowedMentions: am })
-                .catch(e => { logErr(`channel.send(plain) failed: ${e.message}`); return null; });
-            }
-
-            if (sent) logInfo(`Sent chunk ${i + 1}/${chunks.length}`);
-            else      logErr(`All 3 send attempts failed for chunk ${i + 1}`);
-          }
-        };
-
-        await trySend(finalText);
-
-        // React after reply
-        const reactionEmoji = getAutoReaction(aiReply) ?? (botMentioned ? '💬' : '👀');
-        await message.react(reactionEmoji).catch(() => {});
-
-        // Anime GIF — non-blocking
-        const gifMood = detectGifMood(aiReply + ' ' + userText);
-        if (gifMood) {
-          fetchAnimeGif(gifMood).then(url => {
-            if (url) message.channel.send({ content: url, allowedMentions: { parse: [] } }).catch(() => {});
-          }).catch(() => {});
-        }
-
-      } catch (err) {
-        clearInterval(typingInterval);
-        logErr(`AI block catch: ${err.message}`);
-        const errMsg = err?.name === 'AbortError'
-          ? "took too long to think 😭 try again!"
-          : "my brain glitched 😭 try again in a sec!";
-        await message.reply(errMsg)
-          .catch(() => message.channel.send(errMsg).catch(() => {}));
-      }
-
-      return;
-    }
-
-    // ── 5. Auto-emoji reactions on regular messages ───────────────────────────
-    // React to messages that match mood keywords — makes the bot feel alive
-    const autoEmoji = getAutoReaction(message.content);
-    if (autoEmoji) {
-      await message.react(autoEmoji).catch(() => {});
-    }
-
-    // ── 6. Auto-response triggers (custom keyword → embed) ────────────────────
+    // ── 5. Auto-response triggers (custom keyword → embed) ────────────────────
     if (config?.triggers?.length) {
       const content = message.content.toLowerCase();
       for (const trigger of config.triggers) {
