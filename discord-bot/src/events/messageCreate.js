@@ -406,8 +406,10 @@ export default {
       (botNickInServer && msgLower.includes(botNickInServer))
     );
 
-    if (botMentioned || botNamed) {
-      logInfo(`AI trigger: mentioned=${botMentioned} named=${botNamed} user=${message.author.username} msg="${message.content.slice(0, 80)}"`);
+ if (botMentioned || botNamed) {
+  await message.react("👀").catch(() => {});
+  return;
+}
 
       // Resolve mentions to readable names, strip bot mention/name
       const resolved = resolveMentions(message.content, message.guild);
